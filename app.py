@@ -1,80 +1,183 @@
-import os
-import requests
-from flask import Flask, request, jsonify
+        return jsonify({"error": str(exc)}), 500
 
-app = Flask(__name__)
 
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-BRIDGE_API_KEY = os.environ.get("BRIDGE_API_KEY")
-PORT = int(os.environ.get("PORT", "3000"))
+@app.route("/mcp", methods=["OPTIONS"])
+def mcp_options():
+    return cors_response(make_response("", 204))
 
-@app.get("/")
-def health():
-    return jsonify({
-        "name": "Gemini 3.8 Flash ChatGPT Action Bridge",
-        "status": "ok",
-        "endpoint": "/gemini"
-    })
 
-@app.post("/gemini")
-def gemini():
-    if request.headers.get("X-Bridge-Key") != BRIDGE_API_KEY:
-        return jsonify({"error": "Unauthorized"}), 401
+@app.route("/mcp", methods=["GET", "DELETE"])
+def mcp_non_post():
+    # This plugin uses stateless JSON responses. No persistent MCP session
+    # is required, so GET/DELETE are intentionally not used for tool calls.
+    response = make_response(
+        jsonify({
+            "error": "This MCP endpoint uses POST with JSON responses."
+        }),
+        405,
+    )
+    response.headers["Allow"] = "POST, OPTIONS"
+    return cors_response(response)
 
-    if not GEMINI_API_KEY:
-        return jsonify({"error": "Server is missing GEMINI_API_KEY"}), 500
 
-    body = request.get_json(silent=True) or {}
-    prompt = body.get("prompt")
-    system_instruction = body.get("system_instruction")
-    thinking_level = body.get("thinking_level", "medium")
+@app.post("/mcp")
+def mcp():
+    """ Stateless MCP Streamable HTTP endpoint. It implements the handshake-era MCP methods needed by this plugin: - initialize - notifications/initialized - tools/list - tools/call JSON responses are used instead of an SSE stream, which is supported by OpenAI's Streamable HTTP quickstart for stateless MCP servers. """
+    body = request.get_json(silent=True)
 
-    if not isinstance(prompt, str) or not prompt.strip():
-        return jsonify({"error": "prompt is required"}), 400
+    if not isinstance(body, dict):
+        response = jsonify(jsonrpc_error(None, -32600, "Invalid JSON-RPC request"))
+        response.status_code = 400
+        return cors_response(response)
 
-    if thinking_level not in ("low", "medium", "high"):
-        thinking_level = "medium"
+    method = body.get("method")
+    request_id = body.get("id")
 
-    combined_prompt = prompt
-    if system_instruction:
-        combined_prompt = (
-            f"System instructions:\n{system_instruction}\n\n"
-            f"User:\n{prompt}"
+    # MCP notifications do not receive a JSON-RPC response.
+    if method == "notifications/initialized":
+        return cors_response(make_response("", 202))
+
+    if method == "initialize":
+        params = body.get("params") or {}
+        requested_version = params.get("protocolVersion", MCP_PROTOCOL_VERSION)
+
+        # Negotiate the protocol version. This server intentionally supports
+        # the 2025-06-18 handshake used by the plugin.
+        negotiated = (
+            requested_version
+            if requested_version in ("2025-06-18", "2025-03-26")
+            else MCP_PROTOCOL_VERSION
         )
 
-    payload = {
-        "model": "gemini-3.8-flash",
-        "input": combined_prompt,
-        "generation_config": {
-            "thinking_level": thinking_level
-        }
-    }
-
-    try:
-        response = requests.post(
-            "https://generativelanguage.googleapis.com/v1beta/interactions",
-            headers={
-                "x-goog-api-key": GEMINI_API_KEY,
-                "Content-Type": "application/json"
+        result = {
+            "protocolVersion": negotiated,
+            "capabilities": {
+                "tools": {}
             },
-            json=payload,
-            timeout=120
-        )
-        data = response.json()
+            "serverInfo": {
+                "name": MCP_SERVER_NAME,
+                "version": MCP_SERVER_VERSION,
+            },
+            "instructions": (
+                "Use send_prompt when the user explicitly asks to send a "
+                "prompt to Gemini 3.8 Flash."
+            ),
+        }
 
-        if not response.ok:
-            message = data.get("error", {}).get(
-                "message", "Gemini API request failed"
+        response = jsonify(jsonrpc_result(request_id, result))
+        response.headers["MCP-Protocol-Version"] = negotiated
+        return cors_response(response)
+
+    if method == "tools/list":
+        result = {
+            "tools": [
+                {
+                    "name": "send_prompt",
+                    "description": (
+                        "Send an explicit user-provided prompt to Gemini "
+                        "3.8 Flash and return Gemini's response."
+                    ),
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {
+                                "type": "string",
+                                "description": (
+                                    "The exact prompt the user wants sent to Gemini."
+                                ),
+                            },
+                            "system_instruction": {
+                                "type": "string",
+                                "description": (
+                                    "Optional behavior instructions for Gemini."
+                                ),
+                            },
+                            "thinking_level": {
+                                "type": "string",
+                                "enum": ["low", "medium", "high"],
+                                "default": "medium",
+                            },
+                        },
+                        "required": ["prompt"],
+                        "additionalProperties": False,
+                    },
+                }
+            ]
+        }
+
+        response = jsonify(jsonrpc_result(request_id, result))
+        return cors_response(response)
+
+    if method == "tools/call":
+        params = body.get("params") or {}
+        tool_name = params.get("name")
+        arguments = params.get("arguments") or {}
+
+        if tool_name != "send_prompt":
+            response = jsonify(
+                jsonrpc_error(request_id, -32602, "Unknown tool")
             )
-            return jsonify({"error": message}), response.status_code
+            response.status_code = 400
+            return cors_response(response)
 
-        return jsonify({
-            "answer": data.get("output_text", ""),
-            "model": "gemini-3.8-flash"
-        })
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            response = jsonify(
+                jsonrpc_error(request_id, -32602, "prompt is required")
+            )
+            response.status_code = 400
+            return cors_response(response)
 
-    except requests.RequestException:
-        return jsonify({"error": "Could not reach Gemini API"}), 502
+        try:
+            answer = call_gemini(
+                prompt,
+                system_instruction=arguments.get("system_instruction"),
+                thinking_level=arguments.get("thinking_level", "medium"),
+            )
+
+            result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": answer,
+                    }
+                ]
+            }
+            response = jsonify(jsonrpc_result(request_id, result))
+            return cors_response(response)
+
+        except requests.RequestException:
+            result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Could not reach Gemini API.",
+                    }
+                ],
+                "isError": True,
+            }
+            response = jsonify(jsonrpc_result(request_id, result))
+            return cors_response(response)
+
+        except RuntimeError as exc:
+            result = {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": str(exc),
+                    }
+                ],
+                "isError": True,
+            }
+            response = jsonify(jsonrpc_result(request_id, result))
+            return cors_response(response)
+
+    response = jsonify(
+        jsonrpc_error(request_id, -32601, "Method not found")
+    )
+    response.status_code = 404
+    return cors_response(response)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
