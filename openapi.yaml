@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info:
+  title: Gemini 3.8 Flash Bridge
+  version: 1.0.0
+  description: >
+    Sends prompts from a ChatGPT GPT Action to a server-side Gemini 3.8 Flash
+    integration. The Gemini API key is never exposed to ChatGPT.
+servers:
+  - url: https://YOUR-DOMAIN.example.com
+
+paths:
+  /gemini:
+    post:
+      operationId: askGemini
+      summary: Ask Gemini 3.8 Flash
+      description: Send a prompt to Gemini 3.8 Flash and return its answer.
+      security:
+        - bridgeApiKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - prompt
+              properties:
+                prompt:
+                  type: string
+                  description: The user's question or task for Gemini.
+                system_instruction:
+                  type: string
+                  description: Optional behavior instructions for Gemini.
+                thinking_level:
+                  type: string
+                  enum:
+                    - low
+                    - medium
+                    - high
+                  default: medium
+      responses:
+        "200":
+          description: Gemini response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  answer:
+                    type: string
+                  model:
+                    type: string
+        "400":
+          description: Invalid request
+        "401":
+          description: Invalid bridge API key
+        "500":
+          description: Server error
+
+components:
+  securitySchemes:
+    bridgeApiKey:
+      type: apiKey
+      in: header
+      name: X-Bridge-Key
