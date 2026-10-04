@@ -1,40 +1,4 @@
-        return jsonify({"error": str(exc)}), 500
-
-
-@app.route("/mcp", methods=["OPTIONS"])
-def mcp_options():
-    return cors_response(make_response("", 204))
-
-
-@app.route("/mcp", methods=["GET", "DELETE"])
-def mcp_non_post():
-    # This plugin uses stateless JSON responses. No persistent MCP session
-    # is required, so GET/DELETE are intentionally not used for tool calls.
-    response = make_response(
-        jsonify({
-            "error": "This MCP endpoint uses POST with JSON responses."
-        }),
-        405,
-    )
-    response.headers["Allow"] = "POST, OPTIONS"
-    return cors_response(response)
-
-
-@app.post("/mcp")
-def mcp():
-    """ Stateless MCP Streamable HTTP endpoint. It implements the handshake-era MCP methods needed by this plugin: - initialize - notifications/initialized - tools/list - tools/call JSON responses are used instead of an SSE stream, which is supported by OpenAI's Streamable HTTP quickstart for stateless MCP servers. """
-    body = request.get_json(silent=True)
-
-    if not isinstance(body, dict):
-        response = jsonify(jsonrpc_error(None, -32600, "Invalid JSON-RPC request"))
-        response.status_code = 400
-        return cors_response(response)
-
-    method = body.get("method")
-    request_id = body.get("id")
-
-    # MCP notifications do not receive a JSON-RPC response.
-    if method == "notifications/initialized":
+        import os
         return cors_response(make_response("", 202))
 
     if method == "initialize":
