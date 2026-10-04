@@ -1,3 +1,4 @@
-Flask>=3.0,<4
-requests>=2.31,<3
-gunicorn>=22,<24
+mcp==2.3.0
+starlette>=0.47,<1
+uvicorn>=0.35,<1
+requests>=2.32,<3
