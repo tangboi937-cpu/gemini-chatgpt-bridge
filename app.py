@@ -1,8 +1,9 @@
 import os
 import contextlib
+import asyncio
 from collections.abc import AsyncIterator
 
-import httpx
+from google import genai
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -17,7 +18,13 @@ from mcp.server.transport_security import TransportSecuritySettings
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if not GEMINI_API_KEY:
-    print("WARNING: GEMINI_API_KEY is not configured")
+    print("WARNING: GEMINI_API_KEY is missing")
+
+
+# Google Gemini client
+client = genai.Client(
+    api_key=GEMINI_API_KEY
+) if GEMINI_API_KEY else None
 
 
 async def call_gemini(
@@ -26,8 +33,8 @@ async def call_gemini(
     thinking_level: str = "medium"
 ) -> str:
 
-    if not GEMINI_API_KEY:
-        return "Error: GEMINI_API_KEY is missing on the server."
+    if client is None:
+        return "Error: GEMINI_API_KEY is missing on Render."
 
     if thinking_level not in ("low", "medium", "high"):
         thinking_level = "medium"
@@ -42,86 +49,44 @@ async def call_gemini(
             + prompt.strip()
         )
 
-    payload = {
-        "model": "gemini-3.8-flash",
-        "input": combined_prompt,
-        "generation_config": {
-            "thinking_level": thinking_level
-        }
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-
-            response = await client.post(
-                "https://generativelanguage.googleapis.com/v1beta/interactions",
-                headers={
-                    "x-goog-api-key": GEMINI_API_KEY,
-                    "Content-Type": "application/json"
-                },
-                json=payload
-            )
-
-        try:
-            data = response.json()
-        except Exception:
-            data = {}
-
-        if response.status_code < 200 or response.status_code >= 300:
-
-            error = data.get("error", {})
-
-            message = error.get("message")
-
-            if not message:
-                message = response.text[:1000]
-
-            return (
-                f"Gemini API error "
-                f"(HTTP {response.status_code}): {message}"
-            )
-
-        answer = data.get("output_text")
-
-        if isinstance(answer, str) and answer.strip():
-            return answer.strip()
-
-        # Some API responses may put the text in output.
-        output = data.get("output")
-
-        if isinstance(output, list):
-            parts = []
-
-            for item in output:
-                if isinstance(item, dict):
-                    text = item.get("text")
-
-                    if isinstance(text, str):
-                        parts.append(text)
-
-            if parts:
-                return "\n".join(parts).strip()
-
-        return (
-            "Gemini returned successfully, but no text output was found. "
-            f"Raw response: {str(data)[:2000]}"
+    def make_request():
+        return client.interactions.create(
+            model="gemini-3.8-flash",
+            input=combined_prompt,
+            generation_config={
+                "thinking_level": thinking_level
+            }
         )
 
-    except httpx.TimeoutException:
-        return "Error: Gemini API request timed out."
+    try:
+        interaction = await asyncio.to_thread(make_request)
 
-    except httpx.RequestError as exc:
-        return f"Error connecting to Gemini API: {exc}"
+        answer = interaction.output_text
+
+        if answer:
+            return answer
+
+        return "Gemini returned no text."
 
     except Exception as exc:
-        return f"Unexpected Gemini bridge error: {type(exc).__name__}: {exc}"
+        print(
+            f"Gemini request failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        return (
+            f"Gemini API error: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 # ---------------------------------------------------------
-# MCP
+# MCP SERVER
 # ---------------------------------------------------------
 
-mcp = MCPServer("Gemini 3.8 Flash Bridge")
+mcp = MCPServer(
+    "Gemini 3.8 Flash Bridge"
+)
 
 
 @mcp.tool()
@@ -131,10 +96,10 @@ async def send_prompt(
     thinking_level: str = "medium"
 ) -> str:
     """
-    Send a prompt to Gemini 3.8 Flash.
+    Send an explicit prompt to Gemini 3.8 Flash.
     """
 
-    if not isinstance(prompt, str) or not prompt.strip():
+    if not prompt or not prompt.strip():
         return "Error: prompt is required."
 
     return await call_gemini(
@@ -145,7 +110,7 @@ async def send_prompt(
 
 
 # ---------------------------------------------------------
-# Health
+# HEALTH CHECK
 # ---------------------------------------------------------
 
 async def health(request):
@@ -157,7 +122,7 @@ async def health(request):
 
 
 # ---------------------------------------------------------
-# Lifespan
+# MCP LIFESPAN
 # ---------------------------------------------------------
 
 @contextlib.asynccontextmanager
@@ -167,7 +132,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
 
 
 # ---------------------------------------------------------
-# MCP transport security
+# MCP SECURITY
 # ---------------------------------------------------------
 
 security = TransportSecuritySettings(
@@ -184,12 +149,16 @@ security = TransportSecuritySettings(
 
 
 # ---------------------------------------------------------
-# Application
+# STARLETTE
 # ---------------------------------------------------------
 
 app = Starlette(
     routes=[
-        Route("/", health, methods=["GET"]),
+        Route(
+            "/",
+            health,
+            methods=["GET"]
+        ),
 
         Mount(
             "/",
