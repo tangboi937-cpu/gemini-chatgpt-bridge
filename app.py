@@ -2,13 +2,13 @@ import os
 import contextlib
 from collections.abc import AsyncIterator
 
-import requests
+import httpx
 
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Route, Mount
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -16,20 +16,30 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+if not GEMINI_API_KEY:
+    print("WARNING: GEMINI_API_KEY is not configured")
 
-def call_gemini(prompt: str, system_instruction: str = "", thinking_level: str = "medium") -> str:
+
+async def call_gemini(
+    prompt: str,
+    system_instruction: str = "",
+    thinking_level: str = "medium"
+) -> str:
+
     if not GEMINI_API_KEY:
-        raise RuntimeError("Server is missing GEMINI_API_KEY")
+        return "Error: GEMINI_API_KEY is missing on the server."
 
     if thinking_level not in ("low", "medium", "high"):
         thinking_level = "medium"
 
-    combined_prompt = prompt
+    combined_prompt = prompt.strip()
 
     if system_instruction.strip():
         combined_prompt = (
-            f"System instructions:\n{system_instruction}\n\n"
-            f"User:\n{prompt}"
+            "System instructions:\n"
+            + system_instruction.strip()
+            + "\n\nUser:\n"
+            + prompt.strip()
         )
 
     payload = {
@@ -40,75 +50,102 @@ def call_gemini(prompt: str, system_instruction: str = "", thinking_level: str =
         }
     }
 
-    response = requests.post(
-        "https://generativelanguage.googleapis.com/v1beta/interactions",
-        headers={
-            "x-goog-api-key": GEMINI_API_KEY,
-            "Content-Type": "application/json"
-        },
-        json=payload,
-        timeout=120
-    )
-
     try:
-        data = response.json()
-    except ValueError:
-        data = {}
+        async with httpx.AsyncClient(timeout=120.0) as client:
 
-    if not response.ok:
-        error = data.get("error", {})
-        message = error.get(
-            "message",
-            f"Gemini API request failed with HTTP {response.status_code}"
+            response = await client.post(
+                "https://generativelanguage.googleapis.com/v1beta/interactions",
+                headers={
+                    "x-goog-api-key": GEMINI_API_KEY,
+                    "Content-Type": "application/json"
+                },
+                json=payload
+            )
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+
+        if response.status_code < 200 or response.status_code >= 300:
+
+            error = data.get("error", {})
+
+            message = error.get("message")
+
+            if not message:
+                message = response.text[:1000]
+
+            return (
+                f"Gemini API error "
+                f"(HTTP {response.status_code}): {message}"
+            )
+
+        answer = data.get("output_text")
+
+        if isinstance(answer, str) and answer.strip():
+            return answer.strip()
+
+        # Some API responses may put the text in output.
+        output = data.get("output")
+
+        if isinstance(output, list):
+            parts = []
+
+            for item in output:
+                if isinstance(item, dict):
+                    text = item.get("text")
+
+                    if isinstance(text, str):
+                        parts.append(text)
+
+            if parts:
+                return "\n".join(parts).strip()
+
+        return (
+            "Gemini returned successfully, but no text output was found. "
+            f"Raw response: {str(data)[:2000]}"
         )
-        raise RuntimeError(message)
 
-    answer = data.get("output_text")
+    except httpx.TimeoutException:
+        return "Error: Gemini API request timed out."
 
-    if isinstance(answer, str) and answer.strip():
-        return answer
+    except httpx.RequestError as exc:
+        return f"Error connecting to Gemini API: {exc}"
 
-    return "Gemini returned a response, but no text output was found."
+    except Exception as exc:
+        return f"Unexpected Gemini bridge error: {type(exc).__name__}: {exc}"
 
 
 # ---------------------------------------------------------
-# MCP SERVER
+# MCP
 # ---------------------------------------------------------
 
-mcp = MCPServer(
-    "Gemini 3.8 Flash Bridge"
-)
+mcp = MCPServer("Gemini 3.8 Flash Bridge")
 
 
 @mcp.tool()
-def send_prompt(
+async def send_prompt(
     prompt: str,
     system_instruction: str = "",
     thinking_level: str = "medium"
 ) -> str:
     """
-    Send an explicit prompt to Gemini 3.8 Flash and return its response.
+    Send a prompt to Gemini 3.8 Flash.
     """
 
-    if not prompt.strip():
+    if not isinstance(prompt, str) or not prompt.strip():
         return "Error: prompt is required."
 
-    try:
-        return call_gemini(
-            prompt=prompt,
-            system_instruction=system_instruction,
-            thinking_level=thinking_level
-        )
-
-    except requests.RequestException as exc:
-        return f"Error: Could not reach Gemini API: {exc}"
-
-    except RuntimeError as exc:
-        return f"Error: {exc}"
+    return await call_gemini(
+        prompt=prompt,
+        system_instruction=system_instruction,
+        thinking_level=thinking_level
+    )
 
 
 # ---------------------------------------------------------
-# HEALTH CHECK
+# Health
 # ---------------------------------------------------------
 
 async def health(request):
@@ -120,7 +157,7 @@ async def health(request):
 
 
 # ---------------------------------------------------------
-# MCP LIFESPAN
+# Lifespan
 # ---------------------------------------------------------
 
 @contextlib.asynccontextmanager
@@ -130,7 +167,7 @@ async def lifespan(app: Starlette) -> AsyncIterator[None]:
 
 
 # ---------------------------------------------------------
-# RENDER / MCP SECURITY
+# MCP transport security
 # ---------------------------------------------------------
 
 security = TransportSecuritySettings(
@@ -147,16 +184,12 @@ security = TransportSecuritySettings(
 
 
 # ---------------------------------------------------------
-# STARLETTE APPLICATION
+# Application
 # ---------------------------------------------------------
 
 app = Starlette(
     routes=[
-        Route(
-            "/",
-            health,
-            methods=["GET"]
-        ),
+        Route("/", health, methods=["GET"]),
 
         Mount(
             "/",
@@ -182,15 +215,7 @@ app = Starlette(
                 "DELETE",
                 "OPTIONS"
             ],
-            allow_headers=[
-                "Authorization",
-                "Content-Type",
-                "Last-Event-ID",
-                "Mcp-Method",
-                "Mcp-Name",
-                "Mcp-Protocol-Version",
-                "Mcp-Session-Id"
-            ],
+            allow_headers=["*"],
             expose_headers=[
                 "Mcp-Session-Id"
             ]
